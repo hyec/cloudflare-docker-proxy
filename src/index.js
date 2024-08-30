@@ -1,128 +1,188 @@
-addEventListener("fetch", (event) => {
-  event.passThroughOnException();
-  event.respondWith(handleRequest(event.request));
-});
 
-const dockerHub = "https://registry-1.docker.io";
+const defaultUpstream = "registry-1.docker.io";
 
-const routes = {
-  // production
-  "docker.libcuda.so": dockerHub,
-  "quay.libcuda.so": "https://quay.io",
-  "gcr.libcuda.so": "https://gcr.io",
-  "k8s-gcr.libcuda.so": "https://k8s.gcr.io",
-  "k8s.libcuda.so": "https://registry.k8s.io",
-  "ghcr.libcuda.so": "https://ghcr.io",
-  "cloudsmith.libcuda.so": "https://docker.cloudsmith.io",
-  "ecr.libcuda.so": "https://public.ecr.aws",
-
-  // staging
-  "docker-staging.libcuda.so": dockerHub,
-};
-
-function routeByHosts(host) {
-  if (host in routes) {
-    return routes[host];
-  }
-  if (MODE == "debug") {
-    return TARGET_UPSTREAM;
-  }
-  return "";
+function decodeBase64(data) {
+  return atob(data);
 }
 
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  const upstream = routeByHosts(url.hostname);
-  if (upstream === "") {
-    return new Response(
-      JSON.stringify({
-        routes: routes,
-      }),
-      {
-        status: 404,
-      }
-    );
-  }
-  const isDockerHub = upstream == dockerHub;
-  const authorization = request.headers.get("Authorization");
-  if (url.pathname == "/v2/") {
-    const newUrl = new URL(upstream + "/v2/");
-    const headers = new Headers();
-    if (authorization) {
-      headers.set("Authorization", authorization);
-    }
-    // check if need to authenticate
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      headers: headers,
-      redirect: "follow",
-    });
-    if (resp.status === 401) {
-      if (MODE == "debug") {
-        headers.set(
-          "Www-Authenticate",
-          `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
-        );
-      } else {
-        headers.set(
-          "Www-Authenticate",
-          `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
-        );
-      }
-      return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: headers,
-      });
+function encodeBase64(data) {
+  return btoa(data);
+}
+
+/**
+ * handle the authorization header, parse the tokens of requested upstream
+ * @param {Request} request 
+ * @param {object} env 
+ * @returns {[boolean, object]}
+ */
+function handleAuthorization(request, env) {
+
+  const rawHeader = request.headers.get("Authorization");
+  let authorized = true;
+  let registriesTokens = {};
+
+  if (rawHeader) {
+
+    const [scheme, credentials] = rawHeader.split(' ', 2);
+    const decoded = decodeBase64(credentials ?? '');
+
+    if (scheme.toLowerCase() === "basic") {
+      registriesTokens['self'] = decoded;
+    } else if (scheme.toLowerCase() === "bearer") {
+      registriesTokens = JSON.parse(decoded);
     } else {
-      return resp;
+      throw new Error("unexpected authorization: ", rawHeader);
     }
   }
-  // get token
-  if (url.pathname == "/v2/auth") {
-    const newUrl = new URL(upstream + "/v2/");
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      redirect: "follow",
-    });
-    if (resp.status !== 401) {
-      return resp;
+
+  if (env.AUTH_CREDENTIALS) {
+    authorized = registriesTokens['self'] === env.AUTH_CREDENTIALS;
+  }
+
+  return [authorized, registriesTokens];
+}
+
+/**
+ * redirect to auth
+ * @param {Request} request 
+ * @returns {Response}
+ */
+function redirectToAuthPath(request) {
+  const url = new URL(request.url);
+  return new Response(
+    JSON.stringify({ message: "UNAUTHORIZED" }),
+    {
+      status: 401,
+      headers: [
+        ["Content-Type", "application/json"],
+        ["Www-Authenticate", `Bearer realm="${url.protocol}//${url.hostname}/v2/auth",service="docker-proxy"`]
+      ],
     }
-    const authenticateStr = resp.headers.get("WWW-Authenticate");
-    if (authenticateStr === null) {
-      return resp;
+  );
+}
+
+/**
+ * split the upstream from the parts (scope parts or path parts)
+ * @param {Array<String>} parts
+ * @returns {[String, Array<String>]} tuple(upstream, newParts) 
+ */
+function splitUpstream(parts) {
+
+  let upstream = defaultUpstream;
+
+  if (parts.length >= 2 && parts[0].indexOf('.') >= 0) {
+    upstream = parts[0];
+    parts = parts.slice(1);
+  }
+
+  if (upstream === "docker.io") {
+    upstream = "registry-1.docker.io"
+  }
+
+  // add `library` prefix to top level repo
+  if (parts.length == 1) {
+    parts = ["library"].concat(parts);
+  }
+
+  return [upstream, parts];
+}
+
+
+/**
+ * @param {Request} request 
+ * @param {object} env 
+ * @returns {Promise<Response>}
+ */
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+  const [authorized, registriesTokens] = handleAuthorization(request, env);
+
+  if (url.pathname === "/") {
+    return new Response(
+      JSON.stringify({ message: "Hello World!" }),
+      { status: 200, headers: [['Content-Type', 'application/json']] }
+    );
+  } else if (url.pathname == "/v2/") {
+    if (!authorized || !request.headers.get("Authorization")) {
+      return redirectToAuthPath(request);
+    } else {
+      return new Response(
+        JSON.stringify({ message: "SUCCESS" }),
+        { status: 200, headers: [["Content-Type", "application/json"]] }
+      );
     }
-    const wwwAuthenticate = parseAuthenticate(authenticateStr);
+  } else if (url.pathname == "/v2/auth") {
     let scope = url.searchParams.get("scope");
+
     // autocomplete repo part into scope for DockerHub library images
     // Example: repository:busybox:pull => repository:library/busybox:pull
-    if (scope && isDockerHub) {
-      let scopeParts = scope.split(":");
-      if (scopeParts.length == 3 && !scopeParts[1].includes("/")) {
-        scopeParts[1] = "library/" + scopeParts[1];
-        scope = scopeParts.join(":");
+    if (scope) {
+
+      let scopeParts = scope.split(":", 3);
+      let repoParts = (scopeParts[1] ?? '').split("/");
+
+      const [upstream, newRepoParts] = splitUpstream(repoParts);
+
+      scopeParts[1] = newRepoParts.join("/");
+      scope = scopeParts.join(":");
+
+      const resp = await fetch(`https://${upstream}/v2/`, {
+        method: "GET",
+        redirect: "follow",
+      });
+
+      const authenticateStr = resp.headers.get("WWW-Authenticate");
+
+      if (resp.status === 401 && authenticateStr) {
+
+        const wwwAuthenticate = parseAuthenticate(authenticateStr);
+        const upstreamResponse = await fetchToken(wwwAuthenticate, scope, registriesTokens[upstream]);
+
+        registriesTokens[upstream] = (await upstreamResponse.json()).token;
+
+        console.log(`fetched token of upstream: ${upstream}, scope: ${scope}, wwwAuthenticate: ${JSON.stringify(wwwAuthenticate)}`)
       }
     }
-    return await fetchToken(wwwAuthenticate, scope, authorization);
+
+    return new Response(
+      JSON.stringify({token: encodeBase64(JSON.stringify(registriesTokens))}), 
+      { status: 200, headers: [["content-type", "application/json"]] }
+    );
   }
-  // redirect for DockerHub library images
-  // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
-  if (isDockerHub) {
-    const pathParts = url.pathname.split("/");
-    if (pathParts.length == 5) {
-      pathParts.splice(2, 0, "library");
-      const redirectUrl = new URL(url);
-      redirectUrl.pathname = pathParts.join("/");
-      return Response.redirect(redirectUrl, 301);
+
+  if (!authorized) {
+    return redirectToAuthPath(request);
+  }
+
+  if (url.pathname.startsWith("/v2/")) {
+
+    let pathParts = url.pathname.split("/");
+    let repoParts = pathParts.slice(2, -2); // first two: ""/"v2"/
+
+    let [upstream, newRepoParts] = splitUpstream(repoParts);
+
+    let newPath = "/v2/" + newRepoParts.concat(pathParts.slice(-2)).join("/")
+
+    // foward requests
+    const newUrl = new URL("https://" + upstream + newPath); // only support https as upstream
+    const newHeaders = new Headers(request.headers);
+
+    if (registriesTokens[upstream]) {
+      newHeaders.set("Authorization", "Bearer " + registriesTokens[upstream])
+    } else {
+      newHeaders.delete("Authorization");
     }
+
+    console.log(`reverse proxy ${url} to ${newUrl}`)
+
+    return await fetch(newUrl, {
+      method: request.method,
+      headers: newHeaders,
+      redirect: "follow",
+    });
+
   }
-  // foward requests
-  const newUrl = new URL(upstream + url.pathname);
-  const newReq = new Request(newUrl, {
-    method: request.method,
-    headers: request.headers,
-    redirect: "follow",
-  });
-  return await fetch(newReq);
+
 }
 
 function parseAuthenticate(authenticateStr) {
@@ -147,9 +207,21 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
   if (scope) {
     url.searchParams.set("scope", scope);
   }
-  headers = new Headers();
+  const headers = new Headers();
   if (authorization) {
-    headers.set("Authorization", authorization);
+    headers.set("Authorization", "Bearer " + authorization);
   }
+
   return await fetch(url, { method: "GET", headers: headers });
 }
+
+export default {
+  /**
+   * @param {Request} request 
+   * @param {object} env 
+   * @param {Context} ctx 
+   */
+  async fetch(request, env, ctx) {
+    return await handleRequest(request, env);;
+  },
+};

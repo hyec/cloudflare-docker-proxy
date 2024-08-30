@@ -1,21 +1,19 @@
 {
   "name": "cloudflare-docker-proxy",
+  "version": "1.0.0",
   "private": true,
   "description": "",
-  "version": "1.0.0",
-  "author": "ciiiii <allen.cccccnm@gmail.com>",
-  "dependencies": {},
-  "devDependencies": {
-    "prettier": "^2.4.1",
-    "webpack": "^5.65.0",
-    "webpack-cli": "^4.9.1",
-    "wrangler": "^3.36.0"
-  },
-  "scripts": {
-    "format": "prettier --write '**/*.{js,css,json,md}'",
-    "build": "webpack",
-    "dev": "wrangler dev src/index.js --env dev"
-  },
+  "author": "HYec <i@hyec.me>",
   "license": "MIT",
-  "main": "src/index.js"
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.4.5",
+    "wrangler": "^3.60.3",
+    "vitest": "1.5.0"
+  }
 }
